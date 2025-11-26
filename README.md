@@ -1,4 +1,4 @@
-# Process Aware Traffic Capturer (C#)
+<img width="1915" height="1034" alt="image" src="https://github.com/user-attachments/assets/93729dda-3b47-4e9e-8873-a50117d8ef51" /># Process Aware Traffic Capturer (C#)
 
 This project is a high-performance network traffic analysis tool developed in C#. Unlike standard packet sniffers, it **correlates every network packet with the specific Application (Process Name & PID) that generated it** and embeds this information directly into the **PcapNG** file as metadata (packet comments).
 
@@ -27,16 +27,16 @@ To build and run this tool, you need:
 The application runs via command-line arguments.
 
 Basic Commands
-# Show help menu
+### Show help menu
 ProCess.exe -h
 
-# List available network interfaces
+### List available network interfaces
 ProCess.exe -i
 
-# Listen on a specific interface (e.g., index 1) for 60 seconds
+### Listen on a specific interface (e.g., index 1) for 60 seconds
 ProCess.exe -i 1 -t 60
 
-# Save to a specific path and show live details (Verbose)
+### Save to a specific path and show live details (Verbose)
 ProCess.exe -i 1 -t 300 -o "C:\Logs\capture.pcapng" -v
 Arguments
 Argument	Short	Description	Default
