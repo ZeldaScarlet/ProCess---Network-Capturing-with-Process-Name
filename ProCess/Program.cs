@@ -9,10 +9,13 @@ using System.Threading;
 using System.Threading.Tasks;
 using PacketDotNet;
 using SharpPcap;
+using Microsoft.Diagnostics.Tracing;
+using Microsoft.Diagnostics.Tracing.Parsers;
+using Microsoft.Diagnostics.Tracing.Session;
 
 namespace TrafficCapturer
 {
-    // Kuyrukta işlenmeyi bekleyen ham paket yapısı
+    // --- PAKET KUYRUĞU YAPISI ---
     public struct QueuedPacket
     {
         public byte[] Data;
@@ -40,6 +43,8 @@ namespace TrafficCapturer
         // --- GLOBAL NESNELER ---
         static BlockingCollection<QueuedPacket> _packetQueue = new BlockingCollection<QueuedPacket>(new ConcurrentQueue<QueuedPacket>(), 100000);
         static ConcurrentDictionary<int, string> _processNameCache = new ConcurrentDictionary<int, string>();
+
+        // Mapper (IPv4/IPv6 + ETW/Polling Hibrit)
         static PortToPidMapper _portMapper = new PortToPidMapper();
         static CustomPcapNgWriter _pcapWriter;
         static long _totalPacketsCaptured = 0;
@@ -47,13 +52,10 @@ namespace TrafficCapturer
 
         static void Main(string[] args)
         {
+
             ParseArguments(args);
 
-            if (_showHelp)
-            {
-                ShowHelp();
-                return;
-            }
+            if (_showHelp) { ShowHelp(); return; }
 
             // 1. Cihaz Seçimi
             var devices = CaptureDeviceList.Instance;
@@ -64,7 +66,6 @@ namespace TrafficCapturer
             }
 
             ICaptureDevice device = null;
-
             if (_interfaceIndex == -1)
             {
                 Console.WriteLine("--- Ağ Adaptörleri ---");
@@ -84,59 +85,67 @@ namespace TrafficCapturer
             }
             else
             {
-                if (_interfaceIndex >= 0 && _interfaceIndex < devices.Count)
-                    device = devices[_interfaceIndex];
-                else
-                {
-                    Console.WriteLine($"HATA: {_interfaceIndex} numaralı interface bulunamadı.");
-                    return;
-                }
+                if (_interfaceIndex >= 0 && _interfaceIndex < devices.Count) device = devices[_interfaceIndex];
+                else { Console.WriteLine($"HATA: {_interfaceIndex} numaralı interface bulunamadı."); return; }
             }
 
-            // 2. Dosya İsmi Kontrolü
+            // 2. Dosya Hazırlığı
             _outputFile = GetUniqueFilePath(_outputFile);
             string dir = Path.GetDirectoryName(_outputFile);
             if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
 
-            Console.WriteLine($"\nAyarlar:");
-            Console.WriteLine($"---------------------------");
-            Console.WriteLine($"Interface : {device.Description}");
-            Console.WriteLine($"Mod       : {(_promiscuousMode ? "Promiscuous Mod " : "Normal Mod ")}");
-            Console.WriteLine($"Süre      : {_durationSeconds} saniye");
-            Console.WriteLine($"Çıktı     : {_outputFile}");
-            Console.WriteLine($"Verbose   : {(_verbose ? "Açık" : "Kapalı")}");
-            Console.WriteLine($"---------------------------\n");
+            // 3. Mod Başlatma (ETW vs Polling Fallback)
+            bool etwStarted = _portMapper.StartTracking();
 
-            // 3. Başlatma
+            Console.WriteLine($"\n--- DURUM RAPORU ---");
+            Console.WriteLine($"Interface        : {device.Description}");
+            Console.WriteLine($"Çıktı            : {_outputFile}");
+            if (_promiscuousMode)
+            {
+                Console.WriteLine($"Promiscuous Mode : Aktif");
+            }
+            else {
+                Console.WriteLine($"Promiscuous Mode : Kapalı");
+            }
+
+
+            if (etwStarted)
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"Mod       : REAL-TIME (ETW Kernel Events)");
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"Mod       : POLLING (Yönetici izni yok, saniyede 0.5 tarama yapılıyor)");
+                Console.WriteLine("UYARI     : Kısa süreli bağlantılar kaçırılabilir. Tam performans için 'Yönetici Olarak' çalıştırın.");
+            }
+            Console.ResetColor();
+            Console.WriteLine("--------------------\n");
+
             try
             {
-                // Mod seçimi 
                 var mode = _promiscuousMode ? DeviceModes.Promiscuous : DeviceModes.None;
-
-                // Bazı kartlar None modunda Open timeout verebilir, standart read timeout 1000ms ekliyoruz.
                 device.Open(mode, 1000);
 
                 _pcapWriter = new CustomPcapNgWriter(_outputFile);
 
-                // Capture Event
+                // Producer
                 device.OnPacketArrival += (s, e) =>
                 {
                     var raw = e.GetPacket();
                     byte[] dataCopy = new byte[raw.Data.Length];
                     Buffer.BlockCopy(raw.Data, 0, dataCopy, 0, raw.Data.Length);
-
                     _packetQueue.Add(new QueuedPacket(dataCopy, raw.Timeval, raw.LinkLayerType));
                     Interlocked.Increment(ref _totalPacketsCaptured);
                 };
 
-                // Consumer & Mapper Threads
+                // Consumer
                 var processingTask = Task.Factory.StartNew(() => ProcessQueue(), TaskCreationOptions.LongRunning);
-                var tokenSource = new CancellationTokenSource();
-                Task.Run(() => UpdatePortMappingsLoop(tokenSource.Token));
 
                 device.StartCapture();
                 Console.WriteLine($"Yakalama başladı. {_durationSeconds} saniye çalışacak...");
-                Console.WriteLine("(Durdurmak için CTRL+C tuşlayın)");
+                Console.WriteLine("(İptal için CTRL+C)");
 
                 DateTime endTime = DateTime.Now.AddSeconds(_durationSeconds);
                 while (DateTime.Now < endTime)
@@ -146,88 +155,29 @@ namespace TrafficCapturer
                         var keyInfo = Console.ReadKey(true);
                         if (keyInfo.Key == ConsoleKey.C && (keyInfo.Modifiers & ConsoleModifiers.Control) != 0)
                         {
-                            Console.WriteLine("\nKullanıcı tarafından iptal edildi.");
+                            Console.WriteLine("\nİptal edildi.");
                             break;
                         }
                     }
                     Thread.Sleep(100);
                 }
 
-                Console.WriteLine("\nDurduruluyor, lütfen bekleyin...");
+                Console.WriteLine("\nDurduruluyor...");
                 device.StopCapture();
                 device.Close();
                 _packetQueue.CompleteAdding();
+                processingTask.Wait();
 
-                processingTask.Wait(); 
-                tokenSource.Cancel();
                 _pcapWriter.Close();
+                _portMapper.Dispose();
 
                 Console.WriteLine($"\nTamamlandı!");
-                Console.WriteLine($"Yakalanan: {_totalPacketsCaptured}, İşlenen: {_totalPacketsProcessed}");
+                Console.WriteLine($"Yakalanan: {_totalPacketsCaptured}, Kaydedilen: {_totalPacketsProcessed}");
                 Console.WriteLine($"Dosya: {Path.GetFullPath(_outputFile)}");
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"KRİTİK HATA: {ex.Message}");
-            }
-        }
-
-        static void ParseArguments(string[] args)
-        {
-            for (int i = 0; i < args.Length; i++)
-            {
-                string arg = args[i].ToLower();
-
-                if (arg == "-h" || arg == "-help") _showHelp = true;
-                else if (arg == "-v" || arg == "-verbose") _verbose = true;
-                else if (arg == "-p" || arg == "-promiscuous") _promiscuousMode = true; // YENİ PARAMETRE
-                else if (arg == "-t" || arg == "-time")
-                {
-                    if (i + 1 < args.Length && int.TryParse(args[i + 1], out int t)) { _durationSeconds = t; i++; }
-                }
-                else if (arg == "-o" || arg == "-output")
-                {
-                    if (i + 1 < args.Length) { _outputFile = args[i + 1]; i++; }
-                }
-                else if (arg == "-i" || arg == "-interface")
-                {
-                    if (i + 1 < args.Length && int.TryParse(args[i + 1], out int idx))
-                    {
-                        _interfaceIndex = idx;
-                        i++;
-                    }
-                }
-            }
-        }
-
-        static void ShowHelp()
-        {
-            Console.WriteLine("Kullanım: ProCess.exe [parametreler]");
-            Console.WriteLine("-i [no]    : Interface seçimi");
-            Console.WriteLine("-t [sn]    : Yakalama süresi (saniye), Default: 30");
-            Console.WriteLine("-o [path]  : Çıktı dosya yolu, Default: capture.pcapng");
-            Console.WriteLine("-p         : Promiscuous Mod");
-            Console.WriteLine("-v         : Verbose mod (Paketleri ekrana yazar)");
-            Console.WriteLine("-h         : Yardım");
-            Console.WriteLine("\nÖrnek: exe -i 1 -t 60 -p -v");
-        }
-
-        static string GetUniqueFilePath(string path)
-        {
-            if (!File.Exists(path)) return path;
-
-            string dir = Path.GetDirectoryName(path);
-            string name = Path.GetFileNameWithoutExtension(path);
-            string ext = Path.GetExtension(path);
-            int count = 1;
-
-            if (string.IsNullOrEmpty(dir)) dir = Directory.GetCurrentDirectory();
-
-            while (true)
-            {
-                string newName = Path.Combine(dir, $"{name}_{count}{ext}");
-                if (!File.Exists(newName)) return newName;
-                count++;
             }
         }
 
@@ -242,18 +192,22 @@ namespace TrafficCapturer
                     int pid = 0;
 
                     var packet = Packet.ParsePacket(qPacket.LinkLayerType, qPacket.Data);
+
                     var ipPacket = packet.Extract<IPPacket>();
 
                     if (ipPacket != null)
                     {
                         var tcpPacket = packet.Extract<TcpPacket>();
                         var udpPacket = packet.Extract<UdpPacket>();
+
                         string srcIp = ipPacket.SourceAddress.ToString();
                         string dstIp = ipPacket.DestinationAddress.ToString();
                         int srcPort = 0, dstPort = 0;
+                        string proto = "IP";
 
                         if (tcpPacket != null)
                         {
+                            proto = "TCP";
                             srcPort = tcpPacket.SourcePort;
                             dstPort = tcpPacket.DestinationPort;
                             pid = _portMapper.GetPid(srcPort, true);
@@ -261,6 +215,7 @@ namespace TrafficCapturer
                         }
                         else if (udpPacket != null)
                         {
+                            proto = "UDP";
                             srcPort = udpPacket.SourcePort;
                             dstPort = udpPacket.DestinationPort;
                             pid = _portMapper.GetPid(srcPort, false);
@@ -271,18 +226,15 @@ namespace TrafficCapturer
                         {
                             string pName = GetProcessName(pid);
                             processInfo = $"{pName} (PID:{pid})";
-                            logMsg = $"[{pName}] {srcIp}:{srcPort} -> {dstIp}:{dstPort} Len:{qPacket.Data.Length}";
+                            logMsg = $"[{proto}] [{pName}] {srcIp}:{srcPort} -> {dstIp}:{dstPort} Len:{qPacket.Data.Length}";
                         }
                         else
                         {
-                            logMsg = $"[Unknown] {srcIp}:{srcPort} -> {dstIp}:{dstPort} Len:{qPacket.Data.Length}";
+                            logMsg = $"[{proto}] [Unknown] {srcIp}:{srcPort} -> {dstIp}:{dstPort} Len:{qPacket.Data.Length}";
                         }
                     }
 
-                    if (_verbose && !string.IsNullOrEmpty(logMsg))
-                    {
-                        Console.WriteLine(logMsg);
-                    }
+                    if (_verbose && !string.IsNullOrEmpty(logMsg)) Console.WriteLine(logMsg);
 
                     _pcapWriter.WritePacket(qPacket.Data, qPacket.Timeval, processInfo);
                     Interlocked.Increment(ref _totalPacketsProcessed);
@@ -291,49 +243,60 @@ namespace TrafficCapturer
             }
         }
 
-        // Uzantıları al
         static string GetProcessName(int pid)
         {
             if (_processNameCache.TryGetValue(pid, out string name)) return name;
-
             try
             {
                 var proc = Process.GetProcessById(pid);
-                try
-                {
-                    // Tam modül ismini (örn: chrome.exe) almaya çalış
-                    // Sistem dosyaları veya yetki yetmezse hata fırlatabilir.
-                    name = proc.MainModule.ModuleName;
-                }
-                catch
-                {
-                    name = proc.ProcessName;
-                }
+                try { name = proc.MainModule.ModuleName; }
+                catch { name = proc.ProcessName + ".exe"; }
             }
-            catch
-            {
-                name = "Terminated";
-            }
-
+            catch { name = "Terminated"; }
             _processNameCache.TryAdd(pid, name);
             return name;
         }
 
-        static void UpdatePortMappingsLoop(CancellationToken token)
+        static void ParseArguments(string[] args)
         {
-            while (!token.IsCancellationRequested)
+            for (int i = 0; i < args.Length; i++)
             {
-                try
-                {
-                    _portMapper.RefreshTable();
-                    Thread.Sleep(500);
-                }
-                catch { }
+                string arg = args[i].ToLower();
+                if (arg == "-h" || arg == "-help") _showHelp = true;
+                else if (arg == "-v" || arg == "-verbose") _verbose = true;
+                else if (arg == "-p" || arg == "-promiscuous") _promiscuousMode = true;
+                else if (arg == "-t" || arg == "-time") { if (i + 1 < args.Length && int.TryParse(args[i + 1], out int t)) { _durationSeconds = t; i++; } }
+                else if (arg == "-o" || arg == "-output") { if (i + 1 < args.Length) { _outputFile = args[i + 1]; i++; } }
+                else if (arg == "-i" || arg == "-interface") { if (i + 1 < args.Length && int.TryParse(args[i + 1], out int idx)) { _interfaceIndex = idx; i++; } }
             }
+        }
+
+        static void ShowHelp()
+        {
+            Console.WriteLine("Kullanım: ProCess.exe [parametreler]");
+            Console.WriteLine("-i interface [no]    : Interface seçimi. Numara verilmezse listeyi gösterir.");
+            Console.WriteLine("-t time [sn]         : Yakalama süresi (saniye). Default: 30");
+            Console.WriteLine("-o output [path]     : Çıktı dosya yolu. Örn: ../data/out.pcapng");
+            Console.WriteLine("-v verbose           : Verbose mod (Anlık paket detaylarını basar).");
+            Console.WriteLine("-p promiscuous       : Promiscuous Mod");
+            Console.WriteLine("-h help              : Bu yardım ekranını gösterir.");
+            Console.WriteLine("\nÖrnek: ProCess.exe -i 1 -t 60 -v -p -o captures/test.pcapng");
+            Console.WriteLine("\nÖrnek: ProCess.exe --verbose -time 90");
+        }
+
+        static string GetUniqueFilePath(string path)
+        {
+            if (!File.Exists(path)) return path;
+            string dir = Path.GetDirectoryName(path);
+            string name = Path.GetFileNameWithoutExtension(path);
+            string ext = Path.GetExtension(path);
+            int count = 1;
+            if (string.IsNullOrEmpty(dir)) dir = Directory.GetCurrentDirectory();
+            while (true) { string newName = Path.Combine(dir, $"{name}_{count}{ext}"); if (!File.Exists(newName)) return newName; count++; }
         }
     }
 
-    // --- CUSTOM PCAPNG WRITER
+    // --- PCAPNG WRITER 
     public class CustomPcapNgWriter
     {
         private BinaryWriter _writer;
@@ -347,14 +310,7 @@ namespace TrafficCapturer
             WriteInterfaceDescription();
         }
 
-        public void Close()
-        {
-            lock (_lock)
-            {
-                _writer.Flush();
-                _writer.Close();
-            }
-        }
+        public void Close() { lock (_lock) { _writer.Flush(); _writer.Close(); } }
 
         private void WriteSectionHeader()
         {
@@ -383,21 +339,14 @@ namespace TrafficCapturer
                 _writer.Write(6);
                 _writer.Write(blockTotalLength);
                 _writer.Write(0);
-
                 ulong timestamp = (ulong)time.Date.ToUniversalTime().Subtract(new DateTime(1970, 1, 1)).TotalMilliseconds * 1000;
-                _writer.Write((uint)(timestamp >> 32));
-                _writer.Write((uint)(timestamp & 0xFFFFFFFF));
-
-                _writer.Write(data.Length);
-                _writer.Write(data.Length);
-                _writer.Write(data);
-                for (int i = 0; i < dataPadLen; i++) _writer.Write((byte)0);
-
+                _writer.Write((uint)(timestamp >> 32)); _writer.Write((uint)(timestamp & 0xFFFFFFFF));
+                _writer.Write(data.Length); _writer.Write(data.Length);
+                _writer.Write(data); for (int i = 0; i < dataPadLen; i++) _writer.Write((byte)0);
                 if (commentOptLen > 0)
                 {
                     _writer.Write((short)1); _writer.Write((short)commentOptLen);
-                    _writer.Write(commentBytes);
-                    for (int i = 0; i < commentPadLen; i++) _writer.Write((byte)0);
+                    _writer.Write(commentBytes); for (int i = 0; i < commentPadLen; i++) _writer.Write((byte)0);
                     _writer.Write((short)0); _writer.Write((short)0);
                 }
                 _writer.Write(blockTotalLength);
@@ -405,140 +354,201 @@ namespace TrafficCapturer
         }
     }
 
-    // --- PORT MAPPER (Değişmedi)
-    public class PortToPidMapper
+    public class PortToPidMapper : IDisposable
     {
-        private Dictionary<string, int> _table = new Dictionary<string, int>();
-        private readonly object _lock = new object();
+        private ConcurrentDictionary<int, int> _portTable = new ConcurrentDictionary<int, int>();
+        private TraceEventSession _session;
+        private Task _pollingTask;
+        private CancellationTokenSource _cts;
+        private bool _isEtwActive = false;
 
-        public void RefreshTable()
+        public bool StartTracking()
         {
-            var newTable = new Dictionary<string, int>();
+            // 1. Önce tabloları (IPv4 + IPv6) doldur
+            RefreshWin32Tables();
 
-            // 1. TCP Bağlantılarını Al
-            var tcpRows = GetAllTcpConnections();
-            foreach (var row in tcpRows)
+            // 2. ETW Başlatmayı Dene
+            try
             {
-                string key = $"TCP_{row.LocalPort}";
-                if (!newTable.ContainsKey(key)) newTable[key] = row.OwningPid;
-            }
+                _session = new TraceEventSession("TrafficCapturerSession_" + Guid.NewGuid().ToString());
+                _session.EnableKernelProvider(KernelTraceEventParser.Keywords.NetworkTCPIP);
 
-            // 2. UDP Dinleyicilerini Al
-            var udpRows = GetAllUdpListeners();
-            foreach (var row in udpRows)
+                // TCP Events
+                _session.Source.Kernel.TcpIpConnect += (data) => { UpdateTable(data.sport, data.ProcessID, true); UpdateTable(data.dport, data.ProcessID, true); };
+                _session.Source.Kernel.TcpIpAccept += (data) => { UpdateTable(data.sport, data.ProcessID, true); UpdateTable(data.dport, data.ProcessID, true); };
+                _session.Source.Kernel.TcpIpDisconnect += (data) => { /* Silme işlemini es geçiyoruz, overwrite yeterli */ };
+
+                // UDP Events
+                _session.Source.Kernel.UdpIpSend += (data) => { UpdateTable(data.sport, data.ProcessID, false); };
+                _session.Source.Kernel.UdpIpRecv += (data) => { UpdateTable(data.dport, data.ProcessID, false); };
+
+                // Session'ı ayrı thread'de çalıştır (Blocking olduğu için)
+                Task.Run(() =>
+                {
+                    try { _session.Source.Process(); }
+                    catch { /* Session durdurulursa burası fırlatabilir, yutuyoruz */ }
+                });
+
+                _isEtwActive = true;
+                return true; // ETW Başarılı
+            }
+            catch (Exception)
             {
-                string key = $"UDP_{row.LocalPort}";
-                if (!newTable.ContainsKey(key)) newTable[key] = row.OwningPid;
+                // ETW Başarısız (Yönetici izni yok) -> Polling Başlat
+                _isEtwActive = false;
+                StartPollingFallback();
+                return false;
             }
+        }
 
-            lock (_lock) { _table = newTable; }
+        private void StartPollingFallback()
+        {
+            _cts = new CancellationTokenSource();
+            _pollingTask = Task.Run(async () =>
+            {
+                while (!_cts.Token.IsCancellationRequested)
+                {
+                    RefreshWin32Tables();
+                    await Task.Delay(500);
+                }
+            });
         }
 
         public int GetPid(int port, bool isTcp)
         {
-            string key = $"{(isTcp ? "TCP" : "UDP")}_{port}";
-            lock (_lock)
-            {
-                if (_table.TryGetValue(key, out int pid)) return pid;
-            }
+            if (_portTable.TryGetValue(GetKey(port, isTcp), out int pid)) return pid;
             return 0;
         }
 
-        // --- Win32 API Tanımları ---
+        private void UpdateTable(int port, int pid, bool isTcp)
+        {
+            if (port <= 0 || pid <= 0) return;
+            _portTable[GetKey(port, isTcp)] = pid;
+        }
 
-        // TCP API
+        private int GetKey(int port, bool isTcp) => (port << 1) | (isTcp ? 1 : 0);
+
+        public void Dispose()
+        {
+            if (_session != null) { _session.Stop(); _session.Dispose(); }
+            if (_cts != null) _cts.Cancel();
+        }
+
+        // --- WIN32 API (IPv4 & IPv6) ---
+
         [DllImport("iphlpapi.dll", SetLastError = true)]
         static extern uint GetExtendedTcpTable(IntPtr pTcpTable, ref int dwOutBufLen, bool sort, int ipVersion, int tblClass, int reserved);
 
-        // UDP API
         [DllImport("iphlpapi.dll", SetLastError = true)]
         static extern uint GetExtendedUdpTable(IntPtr pUdpTable, ref int dwOutBufLen, bool sort, int ipVersion, int tblClass, int reserved);
 
-        // -- TCP STRUCTS --
+        private const int AF_INET = 2;   // IPv4
+        private const int AF_INET6 = 23; // IPv6
+
+        // Structs for IPv4
+        [StructLayout(LayoutKind.Sequential)] public struct MIB_TCPROW_OWNER_PID { public uint state; public uint localAddr; [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)] public byte[] localPort; public uint remoteAddr; [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)] public byte[] remotePort; public int owningPid; public int LocalPort => (localPort[0] << 8) + localPort[1]; }
+        [StructLayout(LayoutKind.Sequential)] public struct MIB_TCPTABLE_OWNER_PID { public uint dwNumEntries; }
+        [StructLayout(LayoutKind.Sequential)] public struct MIB_UDPROW_OWNER_PID { public uint localAddr; [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)] public byte[] localPort; public int owningPid; public int LocalPort => (localPort[0] << 8) + localPort[1]; }
+        [StructLayout(LayoutKind.Sequential)] public struct MIB_UDPTABLE_OWNER_PID { public uint dwNumEntries; }
+
+        // Structs for IPv6 (Different Layout)
         [StructLayout(LayoutKind.Sequential)]
-        public struct MIB_TCPROW_OWNER_PID
+        public struct MIB_TCP6ROW_OWNER_PID
         {
-            public uint state; public uint localAddr;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)] public byte[] localAddr;
+            public uint localScopeId;
             [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)] public byte[] localPort;
-            public uint remoteAddr;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)] public byte[] remoteAddr;
+            public uint remoteScopeId;
             [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)] public byte[] remotePort;
+            public uint state;
             public int owningPid;
             public int LocalPort => (localPort[0] << 8) + localPort[1];
-            public int OwningPid => owningPid;
         }
+        [StructLayout(LayoutKind.Sequential)] public struct MIB_TCP6TABLE_OWNER_PID { public uint dwNumEntries; }
 
         [StructLayout(LayoutKind.Sequential)]
-        public struct MIB_TCPTABLE_OWNER_PID { public uint dwNumEntries; }
-
-        // -- UDP STRUCTS
-        [StructLayout(LayoutKind.Sequential)]
-        public struct MIB_UDPROW_OWNER_PID
+        public struct MIB_UDP6ROW_OWNER_PID
         {
-            public uint localAddr;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)] public byte[] localAddr;
+            public uint localScopeId;
             [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)] public byte[] localPort;
             public int owningPid;
             public int LocalPort => (localPort[0] << 8) + localPort[1];
-            public int OwningPid => owningPid;
+        }
+        [StructLayout(LayoutKind.Sequential)] public struct MIB_UDP6TABLE_OWNER_PID { public uint dwNumEntries; }
+
+        private void RefreshWin32Tables()
+        {
+            // IPv4 TCP
+            ProcessTable(AF_INET, true, (ptr) => {
+                var tab = (MIB_TCPTABLE_OWNER_PID)Marshal.PtrToStructure(ptr, typeof(MIB_TCPTABLE_OWNER_PID));
+                IntPtr rowPtr = (IntPtr)((long)ptr + Marshal.SizeOf(tab.dwNumEntries));
+                for (int i = 0; i < tab.dwNumEntries; i++)
+                {
+                    var row = (MIB_TCPROW_OWNER_PID)Marshal.PtrToStructure(rowPtr, typeof(MIB_TCPROW_OWNER_PID));
+                    UpdateTable(row.LocalPort, row.owningPid, true);
+                    rowPtr = (IntPtr)((long)rowPtr + Marshal.SizeOf(row));
+                }
+            });
+
+            // IPv4 UDP
+            ProcessTable(AF_INET, false, (ptr) => {
+                var tab = (MIB_UDPTABLE_OWNER_PID)Marshal.PtrToStructure(ptr, typeof(MIB_UDPTABLE_OWNER_PID));
+                IntPtr rowPtr = (IntPtr)((long)ptr + Marshal.SizeOf(tab.dwNumEntries));
+                for (int i = 0; i < tab.dwNumEntries; i++)
+                {
+                    var row = (MIB_UDPROW_OWNER_PID)Marshal.PtrToStructure(rowPtr, typeof(MIB_UDPROW_OWNER_PID));
+                    UpdateTable(row.LocalPort, row.owningPid, false);
+                    rowPtr = (IntPtr)((long)rowPtr + Marshal.SizeOf(row));
+                }
+            });
+
+            // IPv6 TCP
+            ProcessTable(AF_INET6, true, (ptr) => {
+                var tab = (MIB_TCP6TABLE_OWNER_PID)Marshal.PtrToStructure(ptr, typeof(MIB_TCP6TABLE_OWNER_PID));
+                IntPtr rowPtr = (IntPtr)((long)ptr + Marshal.SizeOf(tab.dwNumEntries));
+                for (int i = 0; i < tab.dwNumEntries; i++)
+                {
+                    var row = (MIB_TCP6ROW_OWNER_PID)Marshal.PtrToStructure(rowPtr, typeof(MIB_TCP6ROW_OWNER_PID));
+                    UpdateTable(row.LocalPort, row.owningPid, true);
+                    rowPtr = (IntPtr)((long)rowPtr + Marshal.SizeOf(row));
+                }
+            });
+
+            // IPv6 UDP
+            ProcessTable(AF_INET6, false, (ptr) => {
+                var tab = (MIB_UDP6TABLE_OWNER_PID)Marshal.PtrToStructure(ptr, typeof(MIB_UDP6TABLE_OWNER_PID));
+                IntPtr rowPtr = (IntPtr)((long)ptr + Marshal.SizeOf(tab.dwNumEntries));
+                for (int i = 0; i < tab.dwNumEntries; i++)
+                {
+                    var row = (MIB_UDP6ROW_OWNER_PID)Marshal.PtrToStructure(rowPtr, typeof(MIB_UDP6ROW_OWNER_PID));
+                    UpdateTable(row.LocalPort, row.owningPid, false);
+                    rowPtr = (IntPtr)((long)rowPtr + Marshal.SizeOf(row));
+                }
+            });
         }
 
-        [StructLayout(LayoutKind.Sequential)]
-        public struct MIB_UDPTABLE_OWNER_PID { public uint dwNumEntries; }
-
-        // -- METHODS --
-
-        private List<MIB_TCPROW_OWNER_PID> GetAllTcpConnections()
+        private void ProcessTable(int ipVersion, bool isTcp, Action<IntPtr> processAction)
         {
-            List<MIB_TCPROW_OWNER_PID> tTable = new List<MIB_TCPROW_OWNER_PID>();
             int buffSize = 0;
-            // AF_INET (2) = IPv4, TCP_TABLE_OWNER_PID_ALL (5)
-            GetExtendedTcpTable(IntPtr.Zero, ref buffSize, true, 2, 5, 0);
+            int tblClass = isTcp ? 5 : 1;
+
+            if (isTcp) GetExtendedTcpTable(IntPtr.Zero, ref buffSize, true, ipVersion, tblClass, 0);
+            else GetExtendedUdpTable(IntPtr.Zero, ref buffSize, true, ipVersion, tblClass, 0);
+
+            if (buffSize == 0) return;
 
             IntPtr buffPtr = Marshal.AllocHGlobal(buffSize);
             try
             {
-                if (GetExtendedTcpTable(buffPtr, ref buffSize, true, 2, 5, 0) == 0)
-                {
-                    MIB_TCPTABLE_OWNER_PID tab = (MIB_TCPTABLE_OWNER_PID)Marshal.PtrToStructure(buffPtr, typeof(MIB_TCPTABLE_OWNER_PID));
-                    IntPtr rowPtr = (IntPtr)((long)buffPtr + Marshal.SizeOf(tab.dwNumEntries));
+                uint ret = isTcp
+                    ? GetExtendedTcpTable(buffPtr, ref buffSize, true, ipVersion, tblClass, 0)
+                    : GetExtendedUdpTable(buffPtr, ref buffSize, true, ipVersion, tblClass, 0);
 
-                    for (int i = 0; i < tab.dwNumEntries; i++)
-                    {
-                        MIB_TCPROW_OWNER_PID row = (MIB_TCPROW_OWNER_PID)Marshal.PtrToStructure(rowPtr, typeof(MIB_TCPROW_OWNER_PID));
-                        tTable.Add(row);
-                        rowPtr = (IntPtr)((long)rowPtr + Marshal.SizeOf(row));
-                    }
-                }
+                if (ret == 0) processAction(buffPtr);
             }
             finally { Marshal.FreeHGlobal(buffPtr); }
-            return tTable;
-        }
-
-        // UDP Listeners Metodu
-        private List<MIB_UDPROW_OWNER_PID> GetAllUdpListeners()
-        {
-            List<MIB_UDPROW_OWNER_PID> uTable = new List<MIB_UDPROW_OWNER_PID>();
-            int buffSize = 0;
-            // AF_INET (2) = IPv4, UDP_TABLE_OWNER_PID (1)
-            GetExtendedUdpTable(IntPtr.Zero, ref buffSize, true, 2, 1, 0);
-
-            IntPtr buffPtr = Marshal.AllocHGlobal(buffSize);
-            try
-            {
-                if (GetExtendedUdpTable(buffPtr, ref buffSize, true, 2, 1, 0) == 0)
-                {
-                    MIB_UDPTABLE_OWNER_PID tab = (MIB_UDPTABLE_OWNER_PID)Marshal.PtrToStructure(buffPtr, typeof(MIB_UDPTABLE_OWNER_PID));
-                    IntPtr rowPtr = (IntPtr)((long)buffPtr + Marshal.SizeOf(tab.dwNumEntries));
-
-                    for (int i = 0; i < tab.dwNumEntries; i++)
-                    {
-                        MIB_UDPROW_OWNER_PID row = (MIB_UDPROW_OWNER_PID)Marshal.PtrToStructure(rowPtr, typeof(MIB_UDPROW_OWNER_PID));
-                        uTable.Add(row);
-                        rowPtr = (IntPtr)((long)rowPtr + Marshal.SizeOf(row));
-                    }
-                }
-            }
-            finally { Marshal.FreeHGlobal(buffPtr); }
-            return uTable;
         }
     }
 }
