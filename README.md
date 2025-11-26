@@ -42,17 +42,17 @@ Arguments <br>
 Argument	Short	Description	Default <br>
 --interface	-i	Index of the network interface to listen on. Lists interfaces if omitted.	- <br>
 --time	-t	Capture duration in seconds.	30 <br>
---output	-o	Path for the output PcapNG file.	capture.pcapng
---promiscuous	-p	Enables Promiscuous mode (Captures all traffic on the wire).	Disabled
---verbose	-v	Prints captured packet details to the console in real-time.	Disabled
---help	-h	Shows the help screen.	-
+--output	-o	Path for the output PcapNG file.	capture.pcapng <br>
+--promiscuous	-p	Enables Promiscuous mode (Captures all traffic on the wire)." <br>
+--verbose	-v	Prints captured packet details to the console in real-time.	<br>
+--help	-h	Shows the help screen. <br>
 ## Viewing in Wireshark
-To see the Process Name and PID in Wireshark:
-Open the generated .pcapng file in Wireshark.
-Right-click on the column headers in the packet list -> Column Preferences.
-Add a new column (+).
-Set Type to "Custom".
-Set Fields to pkt_comment (or frame.comment).
-You will now see descriptions like chrome.exe (PID: 1240) next to each packet.
+To see the Process Name and PID in Wireshark: <br>
+Open the generated .pcapng file in Wireshark. <br>
+Right-click on the column headers in the packet list -> Column Preferences. <br>
+Add a new column (+). <br>
+Set Type to "Custom". <br>
+Set Fields to pkt_comment (or frame.comment). <br>
+You will now see descriptions like chrome.exe (PID: 1240) next to each packet. <br>
 <img width="1915" height="1034" alt="image" src="https://github.com/user-attachments/assets/c76da1ca-341d-41d8-9dca-f496cdf525a0" />
 
