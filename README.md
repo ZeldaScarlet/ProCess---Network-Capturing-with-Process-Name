@@ -37,11 +37,11 @@ ProCess.exe -i
 ProCess.exe -i 1 -t 60
 
 ### Save to a specific path and show live details (Verbose)
-ProCess.exe -i 1 -t 300 -o "C:\Logs\capture.pcapng" -v
-Arguments
-Argument	Short	Description	Default
---interface	-i	Index of the network interface to listen on. Lists interfaces if omitted.	-
---time	-t	Capture duration in seconds.	30
+ProCess.exe -i 1 -t 300 -o "C:\Logs\capture.pcapng" -v <br>
+Arguments <br>
+Argument	Short	Description	Default <br>
+--interface	-i	Index of the network interface to listen on. Lists interfaces if omitted.	- <br>
+--time	-t	Capture duration in seconds.	30 <br>
 --output	-o	Path for the output PcapNG file.	capture.pcapng
 --promiscuous	-p	Enables Promiscuous mode (Captures all traffic on the wire).	Disabled
 --verbose	-v	Prints captured packet details to the console in real-time.	Disabled
